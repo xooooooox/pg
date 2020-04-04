@@ -30,6 +30,8 @@ type Curd struct {
 	offset int64                  // 跳过的数据条数
 	page   int64                  // 页码
 	dollar int                    // $n SQL占位符序号
+	id     int64                  // 插入一条数据返回的主键值
+	rows   int64                  // 受影响的行数
 	sql    string                 // SQL
 	args   []interface{}          // SQL args
 	error  error                  // error
@@ -146,10 +148,21 @@ func (x *Curd) Error() error {
 	return x.error
 }
 
-func (x *Curd) Exec(execute string, args ...interface{}) (rows int64) {
+func (x *Curd) Id() int64 {
+	return x.id
+}
+
+func (x *Curd) Rows() int64 {
+	return x.rows
+}
+
+func (x *Curd) Exec(execute string, args ...interface{}) {
 	var err error
+	var rows int64
+	x.ri0()
 	defer func() {
 		x.error = err
+		x.rows = rows
 	}()
 	if x.print {
 		fmt.Println(execute, args) // 输出执行的SQL脚本和对应参数
@@ -187,7 +200,8 @@ func (x *Curd) Exec(execute string, args ...interface{}) (rows int64) {
 	return
 }
 
-func (x *Curd) Add(insert interface{}) (id int64) {
+func (x *Curd) Add(insert interface{}) {
+	x.ri0()
 	if insert == nil {
 		return
 	}
@@ -219,6 +233,10 @@ func (x *Curd) Add(insert interface{}) (id int64) {
 		cols = fmt.Sprintf(`%s, %s`, cols, escaped(column))
 		vals = fmt.Sprintf("%s, %s", vals, dollars(index))
 	}
+	var id int64
+	defer func() {
+		x.id = id
+	}()
 	sqlInsert = fmt.Sprintf(`INSERT INTO %s ( %s ) VALUES ( %s ) RETURNING %s`, escaped(utils.PascalToUnderline(t.Name())), cols, vals, escaped(idname))
 	if x.print {
 		fmt.Println(sqlInsert, args) // 输出执行的SQL脚本和对应参数
@@ -234,7 +252,7 @@ func (x *Curd) Add(insert interface{}) (id int64) {
 	return
 }
 
-func (x *Curd) Adds(batch ...interface{}) (rows int64) {
+func (x *Curd) Adds(batch ...interface{}) {
 	// 传入当前函数的所有结构体信息
 	type insert struct {
 		Table  string
@@ -305,24 +323,27 @@ func (x *Curd) Adds(batch ...interface{}) (rows int64) {
 			Args: append(execs[table].Args, inserts[i].Args...),
 		}
 	}
+	var rows int64 // 批量执行插入sql,返回累计受影响的行数
 	for _, val := range execs {
-		rows += x.Exec(val.Sql, val.Args...)
+		x.Exec(val.Sql, val.Args...)
+		rows += x.rows // 受影响的行数递增
 	}
+	x.rows = rows
 	return
 }
 
-func (x *Curd) Del() int64 {
-	defer x.Clear()
+func (x *Curd) Del() {
+	defer x.clear()
 	x.sql = fmt.Sprintf("DELETE FROM %s", x.table)
 	if x.where != "" {
 		x.sql = fmt.Sprintf("%s WHERE ( %s )", x.sql, x.where)
 	}
-	rows := x.Exec(x.sql, x.args...)
-	return rows
+	x.Exec(x.sql, x.args...)
+	return
 }
 
-func (x *Curd) Ups(ups ...map[string]interface{}) int64 {
-	defer x.Clear()
+func (x *Curd) Ups(ups ...map[string]interface{}) {
+	defer x.clear()
 	if x.update == nil {
 		x.update = map[string]interface{}{}
 	}
@@ -345,33 +366,36 @@ func (x *Curd) Ups(ups ...map[string]interface{}) int64 {
 		set = fmt.Sprintf("%s, %s = %s", set, escaped(k), dollars(x.dollar))
 	}
 	if set == "" {
-		return 0
+		return
 	}
 	x.sql = fmt.Sprintf("UPDATE %s SET %s", x.table, set)
 	if x.where != "" {
-		countDollarInWhere := strings.Count(x.where, dollar)
-		for i := 1; i <= countDollarInWhere; i++ {
-			x.dollar++
-			x.where = strings.Replace(x.where, dollars(i), dollars(x.dollar), -1)
+		if strings.Index(x.where, dollars(1)) > 0 {
+			countDollarInWhere := strings.Count(x.where, dollar)
+			for i := 1; i <= countDollarInWhere; i++ {
+				x.dollar++
+				x.where = strings.Replace(x.where, dollars(i), dollars(x.dollar), -1)
+			}
 		}
 		x.sql = fmt.Sprintf("%s WHERE ( %s )", x.sql, x.where)
 	}
 	x.args = append(x.args, aws...)
-	rows := x.Exec(x.sql, x.args...)
-	return rows
+	x.Exec(x.sql, x.args...)
+	return
 }
 
 // result *AnyStruct LIMIT 1
 // result *[]*AnyStruct LIMIT N, N>1
-func (x *Curd) Get(result interface{}) (err error) {
-	defer x.Clear()
+func (x *Curd) Get(result interface{}) {
+	var err error
+	defer x.clear()
 	defer func() {
 		x.error = err
 	}()
-	err = errors.New("error format args")
 	rt, rv := reflect.TypeOf(result), reflect.ValueOf(result)
 	kind := rt.Kind()
 	if kind != reflect.Ptr {
+		err = errors.New("need a pointer parameter")
 		return
 	}
 	rt1 := rt.Elem()
@@ -405,21 +429,25 @@ func (x *Curd) Get(result interface{}) (err error) {
 	x.sql = fmt.Sprintf("%s OFFSET %d", x.sql, x.offset)
 	if x.limit == 1 {
 		if kind != reflect.Struct {
+			err = errors.New("querying a piece of data requires structure pointer parameters")
 			return
 		}
 	}
 	if x.limit > 1 {
 		if kind != reflect.Slice {
+			err = errors.New("query multiple data, need slice pointer parameters")
 			return
 		}
 		rt1 = rt1.Elem()
 		kind = rt1.Kind()
 		if kind != reflect.Ptr {
+			err = errors.New("query multiple data, need to be a pointer inside the slice")
 			return
 		}
 		rt1 = rt1.Elem()
 		kind = rt1.Kind()
 		if kind != reflect.Struct {
+			err = errors.New("query multiple data, need to be a structure pointer inside the slice")
 			return
 		}
 	}
@@ -429,11 +457,11 @@ func (x *Curd) Get(result interface{}) (err error) {
 	// 执行查询SQL
 	rows, err := DB.Query(x.sql, x.args...)
 	if err != nil {
-		return err
+		return
 	}
 	columns, err := rows.Columns()
 	if err != nil {
-		return err
+		return
 	}
 	// 查询一条
 	if x.limit == 1 {
@@ -452,7 +480,7 @@ func (x *Curd) Get(result interface{}) (err error) {
 		for rows.Next() {
 			err = rows.Scan(cols...)
 			if err != nil {
-				return err
+				return
 			}
 			break
 		}
@@ -477,7 +505,7 @@ func (x *Curd) Get(result interface{}) (err error) {
 		}
 		err = rows.Scan(cols...)
 		if err != nil {
-			return err
+			return
 		}
 		data = reflect.Append(data, row)
 	}
@@ -536,8 +564,27 @@ func (x *Curd) RightJoin(table interface{}, alias interface{}, col1 string, col2
 }
 
 func (x *Curd) Where(where string, args ...interface{}) *Curd {
+	if where == "" {
+		return x
+	}
 	x.where = where
 	x.args = args
+	return x
+}
+
+func (x *Curd) WhereAppend(where string, args ...interface{}) *Curd {
+	if where == "" {
+		return x
+	}
+	if strings.Index(where, dollars(1)) > 0 { // 而且存在 $1, 否则是开发者自己定义, 可能会导致sql执行出错
+		countDollarInWhere := strings.Count(where, dollar)
+		for i := 1; i <= countDollarInWhere; i++ {
+			x.dollar++
+			where = strings.Replace(where, dollars(i), dollars(x.dollar), -1)
+		}
+	}
+	x.where = fmt.Sprintf("%s %s", x.where, where)
+	x.args = append(x.args, args...)
 	return x
 }
 
@@ -798,7 +845,7 @@ func (x *Curd) Page(page int64) *Curd {
 	return x
 }
 
-func (x *Curd) Clear() {
+func (x *Curd) clear() {
 	x.alias = ""
 	x.column = ""
 	x.update = map[string]interface{}{}
@@ -812,4 +859,9 @@ func (x *Curd) Clear() {
 	x.dollar = 0
 	x.sql = ""
 	x.args = []interface{}{}
+}
+
+func (x *Curd) ri0() {
+	x.id = 0
+	x.rows = 0
 }

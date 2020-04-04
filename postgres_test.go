@@ -74,10 +74,11 @@ type User struct {
 	Grade     int     `json:"grade"`
 	Status    int     `json:"-"`
 	Time      int64   `json:"time"`
+	Note      string  `json:"note"`
 }
 
 func init() {
-	db, err := sql.Open("postgres", "dsn")
+	db, err := sql.Open("postgres", "host=47.108.170.129 port=5432 user=xooooooox dbname=house password=xooooooox sslmode=disable")
 	if err != nil {
 		fmt.Println(err)
 	}
@@ -108,6 +109,15 @@ func TestTable(t *testing.T) {
 	Table(&user).Print().WhereOrIn(UserId, 100, 101).Get(&user)
 	Table(&user).Print().WhereOrNotIn(UserId, 100, 101).Get(&user)
 	Table(&user).Print().WhereOrBetween(UserId, 100, 101).Get(&user)
+
+	Table(&user).Print().WhereBetween(UserId, 100, 101).
+		WhereAppend(`AND "status" = $1`, 0).
+		WhereAppend(`OR "time" NOT IN ( $1, $2, $3)`, -1, -2, -3).
+		Get(&user)
+	Table(&user).Print().Where(`"id = $1"`, 100).
+		WhereAppend(`AND "status" = $1`, 0).
+		WhereAppend(`OR "time" NOT IN ( $1, $2, $3)`, -1, -2, -3).
+		Get(&user)
 
 	// specifying column names
 	Table(&user).Print().Cols(UserId, UserName).WhereNotIn(UserId, 100, 101).Get(&user)
@@ -159,83 +169,78 @@ func TestTable(t *testing.T) {
 	fmt.Println(user)
 
 	// insert one row, returns the self-incrementing id of the inserted data
-	id := Table(&user).
-		Print().
-		Add(&User{
-			Nick: "123468900987654321",
-		})
+	tu := Table(&user).Print()
+	tu.Add(&User{
+		Nick: "123468900987654321",
+	})
+	id := tu.Id()
 	fmt.Println(id)
 
-	ups := Table(&user).
-		Print().
-		WhereEqual("id", id).
-		Mod(UserAvatar, "mod-avatar").
-		Ups()
+	tu.WhereEqual("id", id).Mod(UserAvatar, "mod-avatar").Ups()
+	ups := tu.Rows()
 	fmt.Println(ups)
 
-	ups = Table(&user).
-		Print().
+	tu.
 		WhereEqual("id", id).
 		Mod(UserAvatar, "mod-avatar").
 		Mod(UserEmail, "mod-email").
 		Ups()
-	fmt.Println(ups)
+	fmt.Println(tu.Rows())
 
-	ups = Table(&user).
-		Print().
+	tu.
 		WhereEqual("id", id).
 		Mod(UserAvatar, "mod-avatar").
 		Mod(UserEmail, "mod-email").
 		Ups(map[string]interface{}{UserMobile: "ups-mobile"})
-	fmt.Println(ups)
+	fmt.Println(tu.Rows())
 
 	// use more map to update
-	ups = Table(&user).
-		Print().
+	tu.
 		WhereEqual("id", id).
 		Ups(
 			map[string]interface{}{UserMobile: "ups-mobile", UserAvatar: "ups-avatar"},
-			map[string]interface{}{UserEmail: "ups-email", UserAvatar: "ups-avatar", UserTime: times})
-	fmt.Println(ups)
+			map[string]interface{}{UserEmail: "ups-email", UserAvatar: "ups-avatar", UserTime: times},
+		)
+	fmt.Println(tu.Rows())
 
-	dels := Table(&user).
-		Print().
+	tu.
 		WhereEqual(UserId, id).
 		Del()
+	dels := tu.Rows()
 	fmt.Println(dels)
 
-	dels = Table(&user).
-		Print().
+	tu.
 		WhereIn(UserStatus, 90, 91).
 		WhereOrBracketsLeft().
 		WhereOrEqual(UserId, id-1).
 		WhereOrEqual(UserId, id).
 		WhereBracketsRight().
 		Del()
-	fmt.Println(dels)
+	fmt.Println(tu.Rows())
 
-	dels = Table(&user).
-		Print().
+	tu.
 		WhereLessThanEqual(UserId, 0).
 		Del()
-	fmt.Println(dels)
+	fmt.Println(tu.Rows())
 
-	fmt.Println(Table(&user).
-		Print().
+	tu.
 		Adds(&User{
 			Introduce: "1",
 		}, &User{
 			Introduce: "2",
 		}, &User{
 			Introduce: "3",
-		}))
-	fmt.Println(Table(&user).Print().Del())
+		})
+	fmt.Println(tu.Rows())
 
-	tu := Table(&user).Print()
+	//tu.Print().Del() // unspecified where condition will delete all data
+	//fmt.Println(tu.Rows())
+
 	tu.WhereEqual(UserId, 1).Get(&user)
 	fmt.Println(user)
 
-	fmt.Println(tu.WhereEqual(UserId, -200).Del())
+	tu.WhereEqual(UserId, -200).Del()
+	fmt.Println(tu.Rows())
 
 	// checkout error
 	if tu.Error() != nil {
@@ -244,10 +249,11 @@ func TestTable(t *testing.T) {
 
 	// transaction
 	begin := Begin().Table(&user).Print()
-	id = begin.Add(&User{
+	begin.Add(&User{
 		Name: "transaction",
 		Time: times,
 	})
+	id = begin.Id()
 	if id == 0 {
 		fmt.Println("transaction insert error")
 		begin.RollBack()
@@ -255,31 +261,32 @@ func TestTable(t *testing.T) {
 	}
 	fmt.Println(id)
 
-	wid := begin.Add(&User{
+	begin.Add(&User{
 		Email: "231231231@gmail.com",
 		Time:  times,
 	})
+	wid := begin.Id()
 	fmt.Println(wid)
 	if wid == 0 {
 		fmt.Println("transaction insert error")
 		begin.RollBack()
 		return
 	}
-
-	if begin.WhereEqual(UserId, id).Mod(UserAvatar, "avatar").Ups() == 0 { // no need to specify the table name again, if your table name doesn't change
+	begin.WhereEqual(UserId, id).Mod(UserAvatar, "avatar").Ups()
+	if begin.Rows() == 0 { // no need to specify the table name again, if your table name doesn't change
 		fmt.Println("transaction update error")
 		begin.RollBack()
 		return
 	}
-	ups = begin.Table(&User{}).WhereEqual(UserId, wid).Mod(UserNick, "ycm").Ups()
-	if ups == 0 {
+	begin.Table(&User{}).WhereEqual(UserId, wid).Mod(UserNick, "ycm").Ups()
+	if begin.rows == 0 {
 		fmt.Println("transaction update error")
 		begin.RollBack()
 		return
 	}
 
-	dels = begin.WhereEqual(UserId, wid).Del()
-	if dels == 0 {
+	begin.WhereEqual(UserId, wid).Del()
+	if begin.Rows() == 0 {
 		fmt.Println("transaction delete error")
 		begin.RollBack()
 		return
@@ -293,19 +300,18 @@ func TestTable(t *testing.T) {
 
 	// select more rows with group and page data
 	users := []*User{}
-	err := Table(&user).
-		Print().
-		Cols(UserId, UserAvatar, UserNick).
+	tu.
+		Cols(UserId, UserName, UserAvatar, UserNick).
 		WhereMoreThanEqual(UserId, 0).
 		Group(UserId).
 		Limit(10).
 		Page(5).
 		Print().
+		Asc(UserId).
 		Get(&users)
-	if err != nil {
-		fmt.Println(err)
+	if tu.Error() != nil {
+		fmt.Println(tu.Error())
 	}
-
 	for _, v := range users {
 		fmt.Println(v.Id, v.Name, v.Avatar, v.Nick)
 	}
