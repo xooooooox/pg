@@ -79,9 +79,9 @@ func escapes(name string) string {
 	}
 	// 存在 AS 关键字的情况下
 	length := len(name)
-	index := strings.Index(name, "as")
+	index := strings.Index(name, " as ")
 	if index < 0 {
-		index = strings.Index(name, "AS")
+		index = strings.Index(name, " AS ")
 	}
 	if index > 0 && index < length {
 		return fmt.Sprintf("%s AS %s", escaped(name[:index]), escaped(name[index+2:]))
