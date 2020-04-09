@@ -4,50 +4,77 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/xooooooox/utils"
 	"reflect"
 	"strings"
 )
 
 var (
-	idname string = "id" // 主键名称
-	escape string = "\"" // SQL转义字符
-	dollar string = "$"  // SQL占位符
+	pk  string = "id"
+	c32 string = " "
+	c34 string = `"`
+	c44 string = ","
+	c36 string = "$"
+	c63 string = "?"
+	DB  *sql.DB
 )
 
-var DB *sql.DB
-
-type Curd struct {
-	table  string                 // 查询的表名
-	alias  string                 // 表名别名
-	column string                 // 查询列名
-	update map[string]interface{} // 更新列信息
-	join   string                 // 联合查询
-	where  string                 // 条件语句
-	group  string                 // 分组信息
-	order  string                 // 排序信息
-	limit  int64                  // 查询条数
-	offset int64                  // 跳过的数据条数
-	page   int64                  // 页码
-	dollar int                    // $n SQL占位符序号
-	id     int64                  // 插入一条数据返回的主键值
-	rows   int64                  // 受影响的行数
-	sql    string                 // SQL
-	args   []interface{}          // SQL args
-	error  error                  // error
-	tx     *sql.Tx                // transaction
-	print  bool                   // 是否打印执行的SQL脚本及参数
+type InsertMoreRows struct {
+	Table  string
+	Column string
+	Values string
+	Args   []interface{}
 }
 
-// derive 多种数据类型推算出表名
-func derive(table interface{}) string {
+type ExecMoreSql struct {
+	Sql  string
+	Args []interface{}
+}
+
+func PascalToUnderline(s string) string {
+	tmp := []byte{}
+	j := false
+	num := len(s)
+	for i := 0; i < num; i++ {
+		d := s[i]
+		if i > 0 && d >= 'A' && d <= 'Z' && j {
+			tmp = append(tmp, '_')
+		}
+		if d != '_' {
+			j = true
+		}
+		tmp = append(tmp, d)
+	}
+	return strings.ToLower(string(tmp[:]))
+}
+
+func UnderlineToPascal(s string) string {
+	tmp := []byte{}
+	bytes := []byte(s)
+	length := len(bytes)
+	nextLetterNeedToUpper := true
+	for i := 0; i < length; i++ {
+		if bytes[i] == '_' {
+			nextLetterNeedToUpper = true
+			continue
+		}
+		if nextLetterNeedToUpper && bytes[i] >= 'a' && bytes[i] <= 'z' {
+			tmp = append(tmp, bytes[i]-32)
+		} else {
+			tmp = append(tmp, bytes[i])
+		}
+		nextLetterNeedToUpper = false
+	}
+	return string(tmp[:])
+}
+
+func Derive(table interface{}) string {
 	rt := reflect.TypeOf(table)
 	kind := rt.Kind()
 	if kind == reflect.Ptr {
 		rt = rt.Elem()
 		kind = rt.Kind()
 		if kind == reflect.Struct {
-			return utils.PascalToUnderline(rt.Name())
+			return PascalToUnderline(rt.Name())
 		}
 		if kind == reflect.String {
 			return strings.ToLower(reflect.ValueOf(table).Elem().Interface().(string))
@@ -55,7 +82,7 @@ func derive(table interface{}) string {
 		return ""
 	}
 	if kind == reflect.Struct {
-		return utils.PascalToUnderline(rt.Name())
+		return PascalToUnderline(rt.Name())
 	}
 	if kind == reflect.String {
 		return strings.ToLower(table.(string))
@@ -63,80 +90,179 @@ func derive(table interface{}) string {
 	return ""
 }
 
-// escapes SQL转义查询列名
-func escapes(name string) string {
-	// "u"."id"
-	if strings.Index(name, escape) >= 0 {
+func Escape(name string) string {
+	if strings.Index(name, c34) >= 0 {
 		return name
 	}
-	// u.id,u.name,u.email
-	if strings.Index(name, ",") >= 0 {
-		return name
-	}
-	// count(*) as count
-	if strings.Index(name, "(") >= 0 {
-		return name
-	}
-	// 存在 AS 关键字的情况下
-	length := len(name)
-	index := strings.Index(name, " as ")
-	if index < 0 {
-		index = strings.Index(name, " AS ")
-	}
-	if index > 0 && index < length {
-		return fmt.Sprintf("%s AS %s", escaped(name[:index]), escaped(name[index+2:]))
-	}
-	// 没有AS关键字, 普通字段 如: u.id, name
-	return escaped(name)
-}
-
-// escaped SQL转义 email => "email", u.id => "u"."id"
-func escaped(name string) string {
-	if strings.Index(name, escape) >= 0 {
-		return name
-	}
-	if strings.Index(name, ",") >= 0 {
+	if strings.Index(name, c44) >= 0 {
 		return name
 	}
 	name = strings.TrimSpace(name)
-	if strings.Index(name, " ") >= 0 {
+	if strings.Index(name, c32) >= 0 {
 		return name
 	}
-	return fmt.Sprintf(`%s%s%s`, escape, strings.Replace(name, ".", fmt.Sprintf(`%s.%s`, escape, escape), -1), escape)
+	return fmt.Sprintf(`%s%s%s`, c34, strings.Replace(name, ".", fmt.Sprintf(`%s.%s`, c34, c34), -1), c34)
 }
 
-// dollars Postgres 有序的占位符
-func dollars(index int) string {
-	return fmt.Sprintf("%s%d", dollar, index)
+func InsertOneSql(insert interface{}) (sqlStr string, args []interface{}, err error) {
+	if insert == nil {
+		err = errors.New("insert object is nil, require *struct")
+		return
+	}
+	t, v := reflect.TypeOf(insert), reflect.ValueOf(insert)
+	if t.Kind() != reflect.Ptr {
+		err = errors.New("insert object is not a ptr, require *struct")
+		return
+	}
+	t, v = t.Elem(), v.Elem()
+	if t.Kind() != reflect.Struct {
+		err = errors.New("insert object is not a struct ptr, require *struct")
+		return
+	}
+	cols, vals := "", ""
+	args = []interface{}{}
+	index := 0
+	column := ""
+	for i := 0; i < t.NumField(); i++ {
+		column = PascalToUnderline(t.Field(i).Name)
+		if column == pk {
+			continue
+		}
+		args = append(args, v.Field(i).Interface())
+		index++
+		if cols == "" {
+			cols = Escape(column)
+			vals = c63
+			continue
+		}
+		cols = fmt.Sprintf(`%s, %s`, cols, Escape(column))
+		vals = fmt.Sprintf("%s, %s", vals, c63)
+	}
+	sqlStr = fmt.Sprintf(`INSERT INTO %s ( %s ) VALUES ( %s ) RETURNING %s`, Escape(PascalToUnderline(t.Name())), cols, vals, Escape(pk))
+	return
 }
 
-func Table(table interface{}) *Curd {
+func InsertMoreSql(batch ...interface{}) (execs map[string]*ExecMoreSql, err error) {
+	var t reflect.Type
+	var v reflect.Value
+	length := len(batch)
+	table := ""
+	inserts := make([]InsertMoreRows, length, length)
+	sqlIndex := map[string]int{}
+	for i := 0; i < length; i++ {
+		if batch[i] == nil {
+			err = errors.New(fmt.Sprintf("insert object is nil, number %d, require *struct", i))
+			return
+		}
+		t, v = reflect.TypeOf(batch[i]), reflect.ValueOf(batch[i])
+		if t.Kind() != reflect.Ptr {
+			err = errors.New(fmt.Sprintf("insert object is not ptr, number %d, require *struct", i))
+			return
+		}
+		t, v = t.Elem(), v.Elem()
+		if t.Kind() != reflect.Struct {
+			err = errors.New(fmt.Sprintf("insert object is not struct ptr, number %d, require *struct", i))
+			return
+		}
+		table = PascalToUnderline(t.Name())
+		if _, ok := sqlIndex[table]; !ok {
+			sqlIndex[table] = 1
+		}
+		for j := 0; j < v.NumField(); j++ {
+			if PascalToUnderline(t.Field(j).Name) == pk {
+				continue
+			}
+			inserts[i].Table = Escape(table)
+			inserts[i].Args = append(inserts[i].Args, v.Field(j).Interface())
+			if inserts[i].Column == "" {
+				inserts[i].Column = fmt.Sprintf("%s", Escape(PascalToUnderline(t.Field(j).Name)))
+				inserts[i].Values = fmt.Sprintf("%s", c63)
+				sqlIndex[table]++
+				continue
+			}
+			inserts[i].Column = fmt.Sprintf("%s, %s", inserts[i].Column, Escape(PascalToUnderline(t.Field(j).Name)))
+			inserts[i].Values = fmt.Sprintf("%s, %s", inserts[i].Values, fmt.Sprintf("%s", c63))
+			sqlIndex[table]++
+		}
+	}
+	execs = map[string]*ExecMoreSql{}
+	for i := 0; i < length; i++ {
+		table = inserts[i].Table
+		if _, ok := execs[table]; !ok {
+			execs[table] = &ExecMoreSql{}
+		}
+		if execs[table].Sql == "" {
+			execs[table] = &ExecMoreSql{
+				Sql:  fmt.Sprintf("INSERT INTO %s ( %s ) VALUES ( %s )", inserts[i].Table, inserts[i].Column, inserts[i].Values),
+				Args: inserts[i].Args,
+			}
+			continue
+		}
+		execs[table] = &ExecMoreSql{
+			Sql:  fmt.Sprintf("%s, ( %s )", execs[table].Sql, inserts[i].Values),
+			Args: append(execs[table].Args, inserts[i].Args...),
+		}
+	}
+	return
+}
+
+func FormatPostgres(s string) string {
+	count := strings.Count(s, c63)
+	for i := 1; i <= count; i++ {
+		s = strings.Replace(s, c63, fmt.Sprintf("%s%d", c36, i), 1)
+	}
+	return s
+}
+
+type Curd struct {
+	table  string                 // 查询的表名
+	alias  string                 // 表名别名
+	cols   string                 // 查询列名
+	mods   map[string]interface{} // 更新列信息
+	join   string                 // 联合查询
+	where  string                 // 条件语句
+	group  string                 // 分组信息
+	order  string                 // 排序信息
+	limit  int64                  // 查询条数
+	offset int64                  // 跳过的数据条数
+	page   int64                  // 页码
+	result int64                  // 受影响的行数|pk value
+	sql    string                 // SQL
+	args   []interface{}          // SQL args
+	error  error                  // error
+	tx     *sql.Tx                // transaction
+	print  bool                   // 是否打印执行的SQL脚本及参数
+}
+
+// dollars postgres ordered placeholders
+//func dollars(index int) string {
+//	return fmt.Sprintf("%s%d", dollar, index)
+//}
+
+func Table(name ...interface{}) *Curd {
 	x := &Curd{}
-	x.table = escaped(derive(table))
+	x.Table(name...)
 	return x
 }
 
 func Begin() *Curd {
 	x := &Curd{}
-	tx, err := DB.Begin()
-	if err != nil {
-		x.error = err
-		return x
-	}
-	x.tx = tx
+	x.tx, x.error = DB.Begin()
 	return x
 }
 
-func (x *Curd) RollBack() {
+func (x *Curd) RollBack() *Curd {
 	x.error = x.tx.Rollback()
+	return x
 }
 
-func (x *Curd) Commit() {
+func (x *Curd) Commit() *Curd {
 	x.error = x.tx.Commit()
+	return x
 }
 
 func (x *Curd) Print(print ...bool) *Curd {
-	if len(print) > 0 && x.print != print[0] {
+	if len(print) > 0 {
 		x.print = print[0]
 	} else {
 		x.print = true
@@ -144,196 +270,109 @@ func (x *Curd) Print(print ...bool) *Curd {
 	return x
 }
 
+func (x *Curd) printSql() {
+	fmt.Println(x.sql, x.args)
+}
+
 func (x *Curd) Error() error {
 	return x.error
 }
 
-func (x *Curd) Id() int64 {
-	return x.id
+func (x *Curd) Result() int64 {
+	return x.result
 }
 
-func (x *Curd) Rows() int64 {
-	return x.rows
-}
-
-func (x *Curd) Exec(execute string, args ...interface{}) {
+func (x *Curd) Exec(query string, args ...interface{}) *Curd {
+	query = FormatPostgres(query)
+	x.sql, x.args = query, args
 	var err error
 	var rows int64
-	x.ri0()
 	defer func() {
+		x.sql = ""
+		x.args = []interface{}{}
 		x.error = err
-		x.rows = rows
+		x.result = rows
 	}()
 	if x.print {
-		fmt.Println(execute, args) // 输出执行的SQL脚本和对应参数
+		x.printSql()
 	}
 	if x.tx != nil {
-		stmt, err := x.tx.Prepare(execute)
+		stmt, err := x.tx.Prepare(x.sql)
 		if err != nil {
 			x.RollBack()
-			return
+			return x
 		}
-		result, err := stmt.Exec(args...)
+		result, err := stmt.Exec(x.args...)
 		if err != nil {
 			x.RollBack()
-			return
+			return x
 		}
 		rows, err = result.RowsAffected()
 		if err != nil {
 			x.RollBack()
-			return
+			return x
 		}
-		return
+		return x
 	}
-	stmt, err := DB.Prepare(execute)
+	stmt, err := DB.Prepare(x.sql)
 	if err != nil {
-		return
+		return x
 	}
-	result, err := stmt.Exec(args...)
+	result, err := stmt.Exec(x.args...)
 	if err != nil {
-		return
+		return x
 	}
 	rows, err = result.RowsAffected()
 	if err != nil {
-		return
+		return x
 	}
-	return
+	return x
 }
 
-func (x *Curd) Add(insert interface{}) {
-	x.ri0()
-	if insert == nil {
-		return
-	}
-	t, v := reflect.TypeOf(insert), reflect.ValueOf(insert)
-	if t.Kind() != reflect.Ptr {
-		return
-	}
-	t, v = t.Elem(), v.Elem()
-	if t.Kind() != reflect.Struct {
-		return
-	}
-	cols, vals := "", ""
-	args := []interface{}{}
-	index := 0
-	column := ""
-	sqlInsert := ""
-	for i := 0; i < t.NumField(); i++ {
-		column = utils.PascalToUnderline(t.Field(i).Name)
-		if column == idname {
-			continue
-		}
-		args = append(args, v.Field(i).Interface())
-		index++
-		if cols == "" {
-			cols = escaped(column)
-			vals = dollars(index)
-			continue
-		}
-		cols = fmt.Sprintf(`%s, %s`, cols, escaped(column))
-		vals = fmt.Sprintf("%s, %s", vals, dollars(index))
-	}
+func (x *Curd) Add(insert interface{}) *Curd {
 	var id int64
 	defer func() {
-		x.id = id
+		x.result = id
+		x.sql = ""
+		x.args = []interface{}{}
 	}()
-	sqlInsert = fmt.Sprintf(`INSERT INTO %s ( %s ) VALUES ( %s ) RETURNING %s`, escaped(utils.PascalToUnderline(t.Name())), cols, vals, escaped(idname))
+	x.sql, x.args, x.error = InsertOneSql(insert)
+	if x.error != nil {
+		return x
+	}
+	x.sql = FormatPostgres(x.sql)
 	if x.print {
-		fmt.Println(sqlInsert, args) // 输出执行的SQL脚本和对应参数
+		x.printSql()
 	}
 	if x.tx != nil {
-		x.error = x.tx.QueryRow(sqlInsert, args...).Scan(&id)
+		x.error = x.tx.QueryRow(x.sql, x.args...).Scan(&id)
 		if x.error != nil {
 			x.RollBack()
 		}
-		return
+		return x
 	}
-	x.error = DB.QueryRow(sqlInsert, args...).Scan(&id)
-	return
+	x.error = DB.QueryRow(x.sql, x.args...).Scan(&id)
+	return x
 }
 
-func (x *Curd) Adds(batch ...interface{}) {
-	// 传入当前函数的所有结构体信息
-	type insert struct {
-		Table  string
-		Column string
-		Values string
-		Args   []interface{}
+func (x *Curd) Adds(batch ...interface{}) *Curd {
+	var rows int64
+	var execs map[string]*ExecMoreSql
+	defer func() {
+		x.result = rows
+	}()
+	execs, x.error = InsertMoreSql(batch...)
+	for _, v := range execs {
+		x.Exec(v.Sql, v.Args...)
+		rows += x.result
 	}
-	// 需要执行的sql结构体信息
-	type exec struct {
-		Sql  string
-		Args []interface{}
-	}
-	length := len(batch)
-	// 需要插入的数据总条数,每一条的信息
-	inserts := make([]insert, length, length)
-	// 针对每个表的占位符索引
-	sqlIndex := map[string]int{}
-	for i := 0; i < length; i++ {
-		// 不能有空指针
-		if batch[i] == nil {
-			return
-		}
-		t, v := reflect.TypeOf(batch[i]), reflect.ValueOf(batch[i])
-		// 确保参数的每一个参数是指针
-		if t.Kind() != reflect.Ptr {
-			return
-		}
-		t, v = t.Elem(), v.Elem()
-		// 确保参数的每一个参数是结构体指针
-		if t.Kind() != reflect.Struct {
-			return
-		}
-		// 当前这个结构体的所映射的表名
-		table := utils.PascalToUnderline(t.Name())
-		if _, ok := sqlIndex[table]; !ok {
-			sqlIndex[table] = 1 // 占位符索引从1开始
-		}
-		for j := 0; j < v.NumField(); j++ {
-			// 如果column名称是id 跳过 (主键,自动递增)
-			if utils.PascalToUnderline(t.Field(j).Name) == idname {
-				continue
-			}
-			inserts[i].Table = escaped(table)
-			inserts[i].Args = append(inserts[i].Args, v.Field(j).Interface())
-			if inserts[i].Column == "" {
-				inserts[i].Column = fmt.Sprintf("%s", escaped(utils.PascalToUnderline(t.Field(j).Name)))
-				inserts[i].Values = fmt.Sprintf("%s", dollars(sqlIndex[table]))
-				sqlIndex[table]++
-				continue
-			}
-			inserts[i].Column = fmt.Sprintf("%s, %s", inserts[i].Column, escaped(utils.PascalToUnderline(t.Field(j).Name)))
-			inserts[i].Values = fmt.Sprintf("%s, %s", inserts[i].Values, fmt.Sprintf("%s", dollars(sqlIndex[table])))
-			sqlIndex[table]++
-		}
-	}
-	execs := map[string]exec{}
-	for i := 0; i < length; i++ {
-		table := inserts[i].Table
-		if execs[table].Sql == "" {
-			execs[table] = exec{
-				Sql:  fmt.Sprintf("INSERT INTO %s ( %s ) VALUES ( %s )", inserts[i].Table, inserts[i].Column, inserts[i].Values),
-				Args: inserts[i].Args,
-			}
-			continue
-		}
-		execs[table] = exec{
-			Sql:  fmt.Sprintf("%s, ( %s )", execs[table].Sql, inserts[i].Values),
-			Args: append(execs[table].Args, inserts[i].Args...),
-		}
-	}
-	var rows int64 // 批量执行插入sql,返回累计受影响的行数
-	for _, val := range execs {
-		x.Exec(val.Sql, val.Args...)
-		rows += x.rows // 受影响的行数递增
-	}
-	x.rows = rows
-	return
+	return x
 }
 
 func (x *Curd) Del() {
-	defer x.clear()
+	defer func() {
+		x.where = ""
+	}()
 	x.sql = fmt.Sprintf("DELETE FROM %s", x.table)
 	if x.where != "" {
 		x.sql = fmt.Sprintf("%s WHERE ( %s )", x.sql, x.where)
@@ -343,40 +382,34 @@ func (x *Curd) Del() {
 }
 
 func (x *Curd) Ups(ups ...map[string]interface{}) {
-	defer x.clear()
-	if x.update == nil {
-		x.update = map[string]interface{}{}
+	defer func() {
+		x.where = ""
+		x.mods = map[string]interface{}{}
+	}()
+	if x.mods == nil {
+		x.mods = map[string]interface{}{}
 	}
 	for _, v := range ups {
 		for col, val := range v {
-			x.update[col] = val
+			x.mods[col] = val
 		}
 	}
 	aws := x.args
 	set := ""
-	x.dollar = 0
 	x.args = []interface{}{}
-	for k, v := range x.update {
-		x.dollar++
+	for k, v := range x.mods {
 		x.args = append(x.args, v)
 		if set == "" {
-			set = fmt.Sprintf("%s = %s", escaped(k), dollars(x.dollar))
+			set = fmt.Sprintf("%s = %s", Escape(k), c63)
 			continue
 		}
-		set = fmt.Sprintf("%s, %s = %s", set, escaped(k), dollars(x.dollar))
+		set = fmt.Sprintf("%s, %s = %s", set, Escape(k), c63)
 	}
 	if set == "" {
 		return
 	}
 	x.sql = fmt.Sprintf("UPDATE %s SET %s", x.table, set)
 	if x.where != "" {
-		if strings.Index(x.where, dollars(1)) > 0 {
-			countDollarInWhere := strings.Count(x.where, dollar)
-			for i := 1; i <= countDollarInWhere; i++ {
-				x.dollar++
-				x.where = strings.Replace(x.where, dollars(i), dollars(x.dollar), -1)
-			}
-		}
 		x.sql = fmt.Sprintf("%s WHERE ( %s )", x.sql, x.where)
 	}
 	x.args = append(x.args, aws...)
@@ -384,26 +417,22 @@ func (x *Curd) Ups(ups ...map[string]interface{}) {
 	return
 }
 
-// result *AnyStruct LIMIT 1
-// result *[]*AnyStruct LIMIT N, N>1
-func (x *Curd) Get(result interface{}) {
-	var err error
-	defer x.clear()
+func (x *Curd) spliceQuerySql() *Curd {
 	defer func() {
-		x.error = err
+		x.alias = ""
+		x.cols = ""
+		x.join = ""
+		x.where = ""
+		x.group = ""
+		x.order = ""
+		x.limit = 0
+		x.page = 0
+		x.offset = 0
 	}()
-	rt, rv := reflect.TypeOf(result), reflect.ValueOf(result)
-	kind := rt.Kind()
-	if kind != reflect.Ptr {
-		err = errors.New("need a pointer parameter")
-		return
+	if x.cols == "" {
+		x.cols = "*"
 	}
-	rt1 := rt.Elem()
-	kind = rt1.Kind()
-	if x.column == "" {
-		x.column = "*"
-	}
-	x.sql = fmt.Sprintf("SELECT %s FROM %s", x.column, x.table)
+	x.sql = fmt.Sprintf("SELECT %s FROM %s", x.cols, x.table)
 	if x.alias != "" {
 		x.sql = fmt.Sprintf("%s %s", x.sql, x.alias)
 	}
@@ -427,34 +456,36 @@ func (x *Curd) Get(result interface{}) {
 		x.offset = (x.page - 1) * x.limit
 	}
 	x.sql = fmt.Sprintf("%s OFFSET %d", x.sql, x.offset)
-	if x.limit == 1 {
-		if kind != reflect.Struct {
-			err = errors.New("querying a piece of data requires structure pointer parameters")
-			return
-		}
-	}
-	if x.limit > 1 {
-		if kind != reflect.Slice {
-			err = errors.New("query multiple data, need slice pointer parameters")
-			return
-		}
-		rt1 = rt1.Elem()
-		kind = rt1.Kind()
-		if kind != reflect.Ptr {
-			err = errors.New("query multiple data, need to be a pointer inside the slice")
-			return
-		}
-		rt1 = rt1.Elem()
-		kind = rt1.Kind()
-		if kind != reflect.Struct {
-			err = errors.New("query multiple data, need to be a structure pointer inside the slice")
-			return
-		}
-	}
+	x.sql = FormatPostgres(x.sql)
 	if x.print {
-		fmt.Println(x.sql, x.args) // 输出执行的SQL脚本和对应参数
+		x.printSql()
 	}
-	// 执行查询SQL
+	return x
+}
+
+// result *AnyStruct LIMIT 1
+// result *[]*AnyStruct LIMIT N, N>1
+
+func (x *Curd) One(result interface{}) {
+	var err error
+	defer func() {
+		x.error = err
+		x.sql = ""
+		x.args = []interface{}{}
+	}()
+	rt, rv := reflect.TypeOf(result), reflect.ValueOf(result)
+	kind := rt.Kind()
+	if kind != reflect.Ptr {
+		err = errors.New("need a pointer parameter")
+		return
+	}
+	if kind != reflect.Struct {
+		err = errors.New("querying a piece of data requires structure pointer parameters")
+		return
+	}
+	if x.sql == "" {
+		x.spliceQuerySql()
+	}
 	rows, err := DB.Query(x.sql, x.args...)
 	if err != nil {
 		return
@@ -463,31 +494,71 @@ func (x *Curd) Get(result interface{}) {
 	if err != nil {
 		return
 	}
-	// 查询一条
-	if x.limit == 1 {
-		data := rv.Elem()       // 最终返回的数据
-		rzv := reflect.Value{}  // reflect zero value, 反射包零值
-		cols := []interface{}{} // 列名集合
-		for _, cn := range columns {
-			cnv := data.FieldByName(utils.UnderlineToPascal(strings.ToLower(cn))) // 列名全部转换成小写, 下划线命名转帕斯卡命名
-			if cnv == rzv || !cnv.CanSet() {
-				// 结构体缺少cn字段, 或者结构体的cn字段不可访问(小写字母开头)
-				err = errors.New(fmt.Sprintf("structure is missing fields: %s", utils.UnderlineToPascal(cn)))
-				return
-			}
-			cols = append(cols, cnv.Addr().Interface())
+	data := rv.Elem()       // 最终返回的数据
+	rzv := reflect.Value{}  // reflect zero value, 反射包零值
+	cols := []interface{}{} // 列名集合
+	for _, cn := range columns {
+		cnv := data.FieldByName(UnderlineToPascal(strings.ToLower(cn))) // 列名全部转换成小写, 下划线命名转帕斯卡命名
+		if cnv == rzv || !cnv.CanSet() {
+			// 结构体缺少cn字段, 或者结构体的cn字段不可访问(小写字母开头)
+			err = errors.New(fmt.Sprintf("struct is missing field: %s", UnderlineToPascal(cn)))
+			return
 		}
-		for rows.Next() {
-			err = rows.Scan(cols...)
-			if err != nil {
-				return
-			}
-			break
+		cols = append(cols, cnv.Addr().Interface())
+	}
+	for rows.Next() {
+		err = rows.Scan(cols...)
+		if err != nil {
+			return
 		}
-		reflect.ValueOf(result).Elem().Set(data)
+		break
+	}
+	reflect.ValueOf(result).Elem().Set(data)
+	return
+}
+
+func (x *Curd) More(result interface{}) {
+	var err error
+	defer func() {
+		x.error = err
+		x.sql = ""
+		x.args = []interface{}{}
+	}()
+	rt, rv := reflect.TypeOf(result), reflect.ValueOf(result)
+	kind := rt.Kind()
+	if kind != reflect.Ptr {
+		err = errors.New("need a pointer parameter")
 		return
 	}
-	// 查询多条
+	rt1 := rt.Elem()
+	kind = rt1.Kind()
+	if kind != reflect.Slice {
+		err = errors.New("query multiple data, need slice pointer parameters")
+		return
+	}
+	rt1 = rt1.Elem()
+	kind = rt1.Kind()
+	if kind != reflect.Ptr {
+		err = errors.New("query multiple data, need to be a pointer inside the slice")
+		return
+	}
+	rt1 = rt1.Elem()
+	kind = rt1.Kind()
+	if kind != reflect.Struct {
+		err = errors.New("query multiple data, need to be a structure pointer inside the slice")
+		return
+	}
+	if x.sql == "" {
+		x.spliceQuerySql()
+	}
+	rows, err := DB.Query(x.sql, x.args...)
+	if err != nil {
+		return
+	}
+	columns, err := rows.Columns()
+	if err != nil {
+		return
+	}
 	rzv := reflect.Value{} // reflect zero value, 反射包零值
 	data := rv.Elem()      // 最终返回的数据
 	for rows.Next() {
@@ -495,10 +566,10 @@ func (x *Curd) Get(result interface{}) {
 		rowVal := reflect.Indirect(row)
 		cols := []interface{}{} // 列名集合
 		for _, cn := range columns {
-			cnv := rowVal.FieldByName(utils.UnderlineToPascal(strings.ToLower(cn)))
+			cnv := rowVal.FieldByName(UnderlineToPascal(strings.ToLower(cn)))
 			if cnv == rzv || !cnv.CanSet() {
 				// 结构体缺少cn字段, 或者结构体的cn字段不可访问(小写字母开头)
-				err = errors.New(fmt.Sprintf("structure is missing fields: %s", utils.UnderlineToPascal(cn)))
+				err = errors.New(fmt.Sprintf("struct is missing field: %s", UnderlineToPascal(cn)))
 				return
 			}
 			cols = append(cols, cnv.Addr().Interface())
@@ -513,31 +584,39 @@ func (x *Curd) Get(result interface{}) {
 	return
 }
 
-func (x *Curd) Table(table interface{}) *Curd {
-	x.table = escaped(derive(table))
+func (x *Curd) Table(name ...interface{}) *Curd {
+	tmp := ""
+	for _, v := range name {
+		tmp = Escape(Derive(v))
+		if x.table == "" {
+			x.table = tmp
+			continue
+		}
+		x.table = fmt.Sprintf("%s, %s", x.table, tmp)
+	}
 	return x
 }
 
 func (x *Curd) Mod(column string, value interface{}) *Curd {
-	if x.update == nil {
-		x.update = map[string]interface{}{}
+	if x.mods == nil {
+		x.mods = map[string]interface{}{}
 	}
-	x.update[column] = value
+	x.mods[column] = value
 	return x
 }
 
 func (x *Curd) Alias(alias interface{}) *Curd {
-	x.alias = escaped(derive(alias))
+	x.alias = Escape(Derive(alias))
 	return x
 }
 
 func (x *Curd) Cols(cols ...string) *Curd {
 	for _, v := range cols {
-		v = escapes(v)
-		if x.column == "" {
-			x.column = v
+		v = Escape(v)
+		if x.cols == "" {
+			x.cols = v
 		} else {
-			x.column = fmt.Sprintf("%s, %s", x.column, v)
+			x.cols = fmt.Sprintf("%s, %s", x.cols, v)
 		}
 	}
 	return x
@@ -549,17 +628,17 @@ func (x *Curd) Join(table interface{}, alias interface{}, col1 string, col2 stri
 }
 
 func (x *Curd) LeftJoin(table interface{}, alias interface{}, col1 string, col2 string) *Curd {
-	x.join = fmt.Sprintf("%s LEFT JOIN %s %s ON %s = %s", x.join, escaped(derive(table)), escaped(derive(alias)), escaped(col1), escaped(col2))
+	x.join = fmt.Sprintf("%s LEFT JOIN %s %s ON %s = %s", x.join, Escape(Derive(table)), Escape(Derive(alias)), Escape(col1), Escape(col2))
 	return x
 }
 
 func (x *Curd) InnerJoin(table interface{}, alias interface{}, col1 string, col2 string) *Curd {
-	x.join = fmt.Sprintf("%s INNER JOIN %s %s ON %s = %s", x.join, escaped(derive(table)), escaped(derive(alias)), escaped(col1), escaped(col2))
+	x.join = fmt.Sprintf("%s INNER JOIN %s %s ON %s = %s", x.join, Escape(Derive(table)), Escape(Derive(alias)), Escape(col1), Escape(col2))
 	return x
 }
 
 func (x *Curd) RightJoin(table interface{}, alias interface{}, col1 string, col2 string) *Curd {
-	x.join = fmt.Sprintf("%s RIGHT JOIN %s %s ON %s = %s", x.join, escaped(derive(table)), escaped(derive(alias)), escaped(col1), escaped(col2))
+	x.join = fmt.Sprintf("%s RIGHT JOIN %s %s ON %s = %s", x.join, Escape(Derive(table)), Escape(Derive(alias)), Escape(col1), Escape(col2))
 	return x
 }
 
@@ -576,19 +655,12 @@ func (x *Curd) WhereAppend(where string, args ...interface{}) *Curd {
 	if where == "" {
 		return x
 	}
-	if strings.Index(where, dollars(1)) > 0 { // 而且存在 $1, 否则是开发者自己定义, 可能会导致sql执行出错
-		countDollarInWhere := strings.Count(where, dollar)
-		for i := 1; i <= countDollarInWhere; i++ {
-			x.dollar++
-			where = strings.Replace(where, dollars(i), dollars(x.dollar), -1)
-		}
-	}
 	x.where = fmt.Sprintf("%s %s", x.where, where)
 	x.args = append(x.args, args...)
 	return x
 }
 
-func (x *Curd) whereLogic(logic string) string {
+func (x *Curd) whereSplice(logic string) string {
 	x.where = strings.TrimSpace(x.where)
 	if x.where == "" {
 		return ""
@@ -623,185 +695,168 @@ func (x *Curd) WhereBracketsRight() *Curd {
 }
 
 func (x *Curd) WhereEqual(col string, val interface{}) *Curd {
-	col = escaped(col)
-	x.dollar++
+	col = Escape(col)
 	x.args = append(x.args, val)
-	x.where = fmt.Sprintf("%s%s = %s", x.whereLogic("AND"), col, dollars(x.dollar))
+	x.where = fmt.Sprintf("%s%s = %s", x.whereSplice("AND"), col, c63)
 	return x
 }
 
 func (x *Curd) WhereNotEqual(col string, val interface{}) *Curd {
-	col = escaped(col)
-	x.dollar++
+	col = Escape(col)
 	x.args = append(x.args, val)
-	x.where = fmt.Sprintf("%s%s <> %s", x.whereLogic("AND"), col, dollars(x.dollar))
+	x.where = fmt.Sprintf("%s%s <> %s", x.whereSplice("AND"), col, c63)
 	return x
 }
 
 func (x *Curd) WhereMoreThan(col string, val interface{}) *Curd {
-	col = escaped(col)
-	x.dollar++
+	col = Escape(col)
 	x.args = append(x.args, val)
-	x.where = fmt.Sprintf("%s%s > %s", x.whereLogic("AND"), col, dollars(x.dollar))
+	x.where = fmt.Sprintf("%s%s > %s", x.whereSplice("AND"), col, c63)
 	return x
 }
 
 func (x *Curd) WhereMoreThanEqual(col string, val interface{}) *Curd {
-	col = escaped(col)
-	x.dollar++
+	col = Escape(col)
 	x.args = append(x.args, val)
-	x.where = fmt.Sprintf("%s%s >= %s", x.whereLogic("AND"), col, dollars(x.dollar))
+	x.where = fmt.Sprintf("%s%s >= %s", x.whereSplice("AND"), col, c63)
 	return x
 }
 
 func (x *Curd) WhereLessThan(col string, val interface{}) *Curd {
-	col = escaped(col)
-	x.dollar++
+	col = Escape(col)
 	x.args = append(x.args, val)
-	x.where = fmt.Sprintf("%s%s < %s", x.whereLogic("AND"), col, dollars(x.dollar))
+	x.where = fmt.Sprintf("%s%s < %s", x.whereSplice("AND"), col, c63)
 	return x
 }
 
 func (x *Curd) WhereLessThanEqual(col string, val interface{}) *Curd {
-	col = escaped(col)
-	x.dollar++
+	col = Escape(col)
 	x.args = append(x.args, val)
-	x.where = fmt.Sprintf("%s%s <= %s", x.whereLogic("AND"), col, dollars(x.dollar))
+	x.where = fmt.Sprintf("%s%s <= %s", x.whereSplice("AND"), col, c63)
 	return x
 }
 
 func (x *Curd) WhereIn(col string, val ...interface{}) *Curd {
-	col = escaped(col)
+	col = Escape(col)
 	ins := ""
 	for _, v := range val {
-		x.dollar++
 		x.args = append(x.args, v)
 		if ins == "" {
-			ins = dollars(x.dollar)
+			ins = c63
 		} else {
-			ins = fmt.Sprintf("%s, %s", ins, dollars(x.dollar))
+			ins = fmt.Sprintf("%s, %s", ins, c63)
 		}
 	}
-	x.where = fmt.Sprintf("%s%s IN ( %s )", x.whereLogic("AND"), col, ins)
+	x.where = fmt.Sprintf("%s%s IN ( %s )", x.whereSplice("AND"), col, ins)
 	return x
 }
 
 func (x *Curd) WhereNotIn(col string, val ...interface{}) *Curd {
-	col = escaped(col)
+	col = Escape(col)
 	ins := ""
 	for _, v := range val {
-		x.dollar++
 		x.args = append(x.args, v)
 		if ins == "" {
-			ins = dollars(x.dollar)
+			ins = c63
 		} else {
-			ins = fmt.Sprintf("%s, %s", ins, dollars(x.dollar))
+			ins = fmt.Sprintf("%s, %s", ins, c63)
 		}
 	}
-	x.where = fmt.Sprintf("%s%s NOT IN ( %s )", x.whereLogic("AND"), col, ins)
+	x.where = fmt.Sprintf("%s%s NOT IN ( %s )", x.whereSplice("AND"), col, ins)
 	return x
 }
 
 func (x *Curd) WhereBetween(col string, val1 interface{}, val2 interface{}) *Curd {
-	col = escaped(col)
-	x.dollar++
+	col = Escape(col)
 	x.args = append(x.args, val1)
 	x.args = append(x.args, val2)
-	x.where = fmt.Sprintf("%s%s BETWEEN %s AND %s", x.whereLogic("AND"), col, dollars(x.dollar), dollars(x.dollar+1))
-	x.dollar++
+	x.where = fmt.Sprintf("%s%s BETWEEN %s AND %s", x.whereSplice("AND"), col, c63, c63)
+
 	return x
 }
 
 func (x *Curd) WhereOrEqual(col string, val interface{}) *Curd {
-	x.dollar++
 	x.args = append(x.args, val)
-	x.where = fmt.Sprintf("%s%s = %s", x.whereLogic("OR"), escaped(col), dollars(x.dollar))
+	x.where = fmt.Sprintf("%s%s = %s", x.whereSplice("OR"), Escape(col), c63)
 	return x
 }
 
 func (x *Curd) WhereOrNotEqual(col string, val interface{}) *Curd {
-	x.dollar++
+
 	x.args = append(x.args, val)
-	x.where = fmt.Sprintf("%s%s <> %s", x.whereLogic("OR"), escaped(col), dollars(x.dollar))
+	x.where = fmt.Sprintf("%s%s <> %s", x.whereSplice("OR"), Escape(col), c63)
 	return x
 }
 
 func (x *Curd) WhereOrMoreThan(col string, val interface{}) *Curd {
-	col = escaped(col)
-	x.dollar++
+	col = Escape(col)
 	x.args = append(x.args, val)
-	x.where = fmt.Sprintf("%s%s > %s", x.whereLogic("OR"), col, dollars(x.dollar))
+	x.where = fmt.Sprintf("%s%s > %s", x.whereSplice("OR"), col, c63)
 	return x
 }
 
 func (x *Curd) WhereOrMoreThanEqual(col string, val interface{}) *Curd {
-	col = escaped(col)
-	x.dollar++
+	col = Escape(col)
 	x.args = append(x.args, val)
-	x.where = fmt.Sprintf("%s%s >= %s", x.whereLogic("OR"), col, dollars(x.dollar))
+	x.where = fmt.Sprintf("%s%s >= %s", x.whereSplice("OR"), col, c63)
 	return x
 }
 
 func (x *Curd) WhereOrLessThan(col string, val interface{}) *Curd {
-	col = escaped(col)
-	x.dollar++
+	col = Escape(col)
 	x.args = append(x.args, val)
-	x.where = fmt.Sprintf("%s%s < %s", x.whereLogic("OR"), col, dollars(x.dollar))
+	x.where = fmt.Sprintf("%s%s < %s", x.whereSplice("OR"), col, c63)
 	return x
 }
 
 func (x *Curd) WhereOrLessThanEqual(col string, val interface{}) *Curd {
-	col = escaped(col)
-	x.dollar++
+	col = Escape(col)
 	x.args = append(x.args, val)
-	x.where = fmt.Sprintf("%s%s <= %s", x.whereLogic("OR"), col, dollars(x.dollar))
+	x.where = fmt.Sprintf("%s%s <= %s", x.whereSplice("OR"), col, c63)
 	return x
 }
 
 func (x *Curd) WhereOrIn(col string, val ...interface{}) *Curd {
-	col = escaped(col)
+	col = Escape(col)
 	ins := ""
 	for _, v := range val {
-		x.dollar++
 		x.args = append(x.args, v)
 		if ins == "" {
-			ins = dollars(x.dollar)
+			ins = c63
 		} else {
-			ins = fmt.Sprintf("%s, %s", ins, dollars(x.dollar))
+			ins = fmt.Sprintf("%s, %s", ins, c63)
 		}
 	}
-	x.where = fmt.Sprintf("%s%s IN ( %s )", x.whereLogic("OR"), col, ins)
+	x.where = fmt.Sprintf("%s%s IN ( %s )", x.whereSplice("OR"), col, ins)
 	return x
 }
 
 func (x *Curd) WhereOrNotIn(col string, val ...interface{}) *Curd {
-	col = escaped(col)
+	col = Escape(col)
 	ins := ""
 	for _, v := range val {
-		x.dollar++
 		x.args = append(x.args, v)
 		if ins == "" {
-			ins = dollars(x.dollar)
+			ins = c63
 		} else {
-			ins = fmt.Sprintf("%s, %s", ins, dollars(x.dollar))
+			ins = fmt.Sprintf("%s, %s", ins, c63)
 		}
 	}
-	x.where = fmt.Sprintf("%s%s NOT IN ( %s )", x.whereLogic("OR"), col, ins)
+	x.where = fmt.Sprintf("%s%s NOT IN ( %s )", x.whereSplice("OR"), col, ins)
 	return x
 }
 
 func (x *Curd) WhereOrBetween(col string, val1 interface{}, val2 interface{}) *Curd {
-	col = escaped(col)
-	x.dollar++
+	col = Escape(col)
 	x.args = append(x.args, val1)
 	x.args = append(x.args, val2)
-	x.where = fmt.Sprintf("%s%s BETWEEN %s AND %s", x.whereLogic("OR"), col, dollars(x.dollar), dollars(x.dollar+1))
-	x.dollar++
+	x.where = fmt.Sprintf("%s%s BETWEEN %s AND %s", x.whereSplice("OR"), col, c63, c63)
+
 	return x
 }
 
 func (x *Curd) Group(group string) *Curd {
-	group = escaped(group)
+	group = Escape(group)
 	if x.group == "" {
 		x.group = group
 	} else {
@@ -811,7 +866,7 @@ func (x *Curd) Group(group string) *Curd {
 }
 
 func (x *Curd) Asc(name string) *Curd {
-	name = escaped(name)
+	name = Escape(name)
 	if x.order == "" {
 		x.order = fmt.Sprintf("%s ASC", name)
 	} else {
@@ -821,7 +876,7 @@ func (x *Curd) Asc(name string) *Curd {
 }
 
 func (x *Curd) Desc(name string) *Curd {
-	name = escaped(name)
+	name = Escape(name)
 	if x.order == "" {
 		x.order = fmt.Sprintf("%s DESC", name)
 	} else {
@@ -843,25 +898,4 @@ func (x *Curd) Offset(offset int64) *Curd {
 func (x *Curd) Page(page int64) *Curd {
 	x.page = page
 	return x
-}
-
-func (x *Curd) clear() {
-	x.alias = ""
-	x.column = ""
-	x.update = map[string]interface{}{}
-	x.join = ""
-	x.where = ""
-	x.group = ""
-	x.order = ""
-	x.limit = 0
-	x.offset = 0
-	x.page = 0
-	x.dollar = 0
-	x.sql = ""
-	x.args = []interface{}{}
-}
-
-func (x *Curd) ri0() {
-	x.id = 0
-	x.rows = 0
 }

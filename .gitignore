@@ -5,3 +5,4 @@
 *.a
 *.out
 *.so
+*_test.go
